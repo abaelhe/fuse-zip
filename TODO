@@ -1,0 +1,2 @@
+* write memory cache to /tmp on fsync(). May be write compressed stream
+* operate with archive without libzip
