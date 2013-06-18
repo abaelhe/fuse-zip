@@ -1,0 +1,1531 @@
+#!/bin/sh
+# \
+exec tclsh "$0" "$@"
+
+package require Tcl 8.5
+package require BLT
+package require Tclx
+package require cmdline
+package require struct::set
+package require control
+
+::control::control assert enabled true
+
+namespace eval ::fusezip::test {
+    namespace import ::control::assert
+
+    variable binary [file join [file dirname [info script]] ../../fuse-zip]
+    variable tmpdir [ exec mktemp -d "/tmp/fuse-zip-tests-[ pid ].XXXXXXXXXX" ]
+    # two minutes
+    variable timeout [ expr {1000 * 60 * 2} ]
+
+    variable valgrind false
+    variable listTests false
+
+    variable status {}
+    variable error {}
+    variable output {}
+    variable initializationState {}
+
+    variable numPassed 0
+    variable numFailed 0
+    variable numSkipped 0
+    variable failed {}
+
+    # parseArgs --
+    #
+    #   Parse commnd-line arguments.
+    #   Keys -list, -valgrind, -listfailed are recognized, all other parameters
+    #   added to match list to filter tests.
+
+    proc parseArgs {} {
+        variable matchList
+        upvar #0 argv argv
+
+        set options {
+            {list       "List tests and exit"}
+            {valgrind   "Run tests under valgrind and check memory errors"}
+            {-help      "Print this message"}
+        }
+        
+        if {[ catch {
+            array set p [ ::cmdline::getKnownOptions argv $options ]
+        } msg ]} {
+            puts stderr $msg
+            exit 1
+        }
+        if {$p(-help)} {
+            puts [ ::cmdline::usage $options ]
+            exit 1
+        }
+        variable listTests $p(list)
+        variable valgrind $p(valgrind)
+
+        if {[ llength $argv ] != 0} {
+            set matchList $argv
+        } else {
+            set matchList *
+        }
+    }
+
+    # wrapIfNeeded --
+    #
+    #   Wrap executable using valgrind if valgrinding is enabled (environment
+    #   variable VALGRIND is set to 1).
+    #   If env. variable VALGRIND_ARGS is present, it recognized as
+    #   space-separated list of additional arguments for valgrind (for example,
+    #   VALGRIND_ARGS="--gen-suppressions=all").
+
+    proc wrapIfNeeded {command} {
+        variable valgrind
+
+        if {$valgrind} {
+            set additional {}
+            if {[ info exists ::env(VALGRIND_ARGS) ]} {
+                set additional [ split $::env(VALGRIND_ARGS) ]
+            }
+            set res [ list valgrind -q --leak-check=full --track-origins=yes --error-exitcode=33 --suppressions=valgrind.supp {*}$additional ]
+        } else {
+            set res {}
+        }
+        lappend res $command
+        return $res
+    }
+
+    # fstest --
+    #
+    #   Execute 'script', check return code and clean up.
+    #   If script exited with error, error information and filesystem stderr
+    #   printed.
+    #   Test is executed only if id matches at least one pattern in matchList.
+    #
+    # Arguments:
+    #   id          Test ID
+    #   description Test Description
+    #   script      Test body
+
+    proc fstest {id description script} {
+        variable mounted false
+        variable error
+        variable numPassed
+        variable numFailed
+        variable numSkipped
+        variable tmpdir
+        variable mountdir
+        variable matchList
+        variable failed
+        upvar fname fname
+        set fname {}
+
+        set do false
+        foreach match $matchList {
+            if {[ string match $match $id ]} {
+                set do true
+                break
+            }
+        }
+        if {!$do} {
+            incr numSkipped
+            return
+        }
+
+        file mkdir $tmpdir
+        set mountdir "[ file join $tmpdir mountPoint ]-$id"
+        file mkdir $mountdir
+        set code [ catch {
+            if {[ catch {
+                uplevel $script
+            } err opts ]} {
+                if {[ catch {
+                    umount
+                } err2 opts2 ]} {
+                    dict set opts2 -cause $opts
+                    return -options $opts2
+                }
+                return -options $opts
+            }
+        } ret opts ]
+        switch $code {
+            0 {
+                # TCL_OK
+                incr numPassed
+            }
+            1 {
+                # TCL_ERROR
+                forceumount
+                puts "\nTest `$id' ($description) failed."
+                puts ""
+                puts "Error: [ dict get $opts -errorinfo ]"
+                puts "Error code [ dict get $opts -code ], errorcode [ dict get $opts -errorcode ]"
+                if {[ dict exists $opts -cause ]} {
+                    set opts [ dict get $opts -cause ]
+                    puts "Caused by:"
+                    puts "Error: [ dict get $opts -errorinfo ]"
+                    puts "Error code [ dict get $opts -code ], errorcode [ dict get $opts -errorcode ]"
+                }
+                puts ""
+                puts "Filesystem output: [ join $error \n ]"
+
+                lappend failed $id
+                incr numFailed
+            }
+            default {
+                puts "\nTest `$id' ($description) returned incorrect code($code): [ lindex {OK ERROR RETURN BREAK CONTINUE} $code ]"
+                incr numSkipped
+            }
+        }
+        catch {file delete -force $tmpdir}
+    }
+
+    # mount --
+    #
+    #   Mount fuse-zip on archive fname to mountdir.
+    #   Filesystem process started in background but without detaching from
+    #   terminal and with debug mode enabled. Messages sent to stderr are
+    #   parsed to determine finish of file system initialization process.
+    #
+    # Variables:
+    #   fname   Archive file name (from caller context)
+    # Arguments:
+    #   args    Additional file system arguments
+
+    proc mount {args} {
+        upvar fname fname
+        variable binary
+        variable mountdir
+        variable stopped
+        variable output
+        variable error
+        variable mounted
+        variable initializationState
+
+        set ns [ namespace current ]
+        set ${ns}::status {STARTED}
+        # if file system stopped in abnormal way, variable
+        # 'initializationState' is set to exit from vwait block.
+        set cmd [ list ${ns}::status {write unset} \
+            [ list apply [ list {args} {
+                variable initializationState exited
+            } $ns ] ] \
+        ]
+        trace add variable {*}$cmd
+        set output {}
+        set error {}
+        blt::bgexec ${ns}::status \
+            -output ${ns}::output \
+            -onerror ${ns}::processError \
+            -linebuffered true \
+            {*}[ wrapIfNeeded $binary ] {*}$args -d $fname $mountdir &
+
+        vwait ${ns}::initializationState
+        trace remove variable {*}$cmd
+        if {$initializationState eq "exited"} {
+            error "Filesystem not mounted (status=[ set ${ns}::status ])" {} NOTMOUNTED
+        }
+        set mounted true
+    }
+
+    # processError --
+    #
+    #   Process each line of stderr of called file system.
+    #   Each line is appended to 'error' list to accumulate full output.
+    #   If first message successfully went from filesystem, it assumed as
+    #   mounted and listeners are notified by setting variable
+    #   'initializationState'.
+    #
+    # Arguments:
+    #   data    Line to process
+
+    proc processError {data} {
+        variable initializationState
+        variable error
+
+        if {[ regexp {^   unique: 1,.*[Ss]uccess.*, outsize: \d+$} $data ]} {
+            set initializationState success
+        }
+        lappend error $data
+    }
+
+    # umount --
+    # 
+    #   Unmount filesystem.
+    #   Firstly try to umount FS in a standard way via fusermount -uz.
+    #   If file system is not unmounted in a specified timeout, kill filesystem
+    #   process and unmount in the hard way (fusermount -uz).
+    #   If file system is already unmounted. do nothing.
+
+    proc umount {} {
+        variable mounted
+        variable mountdir
+        variable status
+        variable timeout
+        variable output
+        variable error
+        variable valgrind
+
+        if {!$mounted} {
+            return
+        }
+
+        set ns [ namespace current ]
+        set statusVar ${ns}::status
+        if {$status ne ""} {
+            # not yet stopped
+            if {[ catch {
+                exec fusermount -uz $mountdir
+            } err opts ]} {
+                puts "Fusermount error: $err"
+            }
+            set afterId [ after $timeout [ list set $statusVar KILLED ] ]
+            vwait $statusVar
+            after cancel $afterId
+        }
+        lassign $status state pid code msg
+        set status {}
+        set mounted false
+        if {$state eq "KILLED"} {
+            catch {exec fusermount -uz $mountdir}
+            error "Filesystem unmounting timed out"
+        } else {
+            if {$code != 0} {
+                error "Filesystem returned error (code=$code)"
+            }
+            if {$output ne ""} {
+                error "Unexpected output from filesystem: $output"
+            }
+        }
+    }
+
+    # forceumount --
+    #
+    #   Force kill filesystem process and free mountpoint
+
+    proc forceumount {} {
+        variable mountdir
+        variable status
+        
+        catch {exec fusermount -u $mountdir}
+        set [ namespace current ]::status FORCE-KILLED
+        catch {exec fusermount -uz $mountdir}
+    }
+
+    # create -- 
+    #
+    #   Create specified list of files and directories in specified directory
+    #   (relative to tmpdir).
+    #
+    # Arguments:
+    #   dir     Destination directory
+    #   files   List of files and directories to add
+    #           Format of item:
+    #           <filename> <content
+    #           or
+    #           <dirname>/
+
+    proc createContent {dir files} {
+        variable tmpdir
+
+        file delete -force $tmpdir/$dir
+        file mkdir $tmpdir/$dir
+        
+        set pos 0
+        while {$pos < [ llength $files ]} {
+            set name [ lindex $files $pos ]
+            incr pos
+            if {[ string index $name end ] == "/"} {
+                file mkdir $tmpdir/$dir/$name
+            } else {
+                makeFile [ lindex $files $pos ] $dir/$name
+                incr pos
+            }
+        }
+    }
+
+    # create -- 
+    #
+    #   Create archive for tests containing specified list of files and
+    #   directories and set it name to variable fname in caller context.
+    #
+    # Arguments:
+    #   files   List of files (as for createContent command)
+
+    proc create {files} {
+        variable tmpdir
+        upvar fname fname
+
+        set fname $tmpdir/test.zip
+
+        createContent archiveSource $files
+        set pwd [ pwd ]
+        cd $tmpdir/archiveSource
+        if {[ catch {
+            exec zip -r $fname {*}[ glob * ]
+        } err opts ]} {
+            cd $pwd
+            return -options $opts
+        }
+        cd $pwd
+    }
+
+    # check --
+    #
+    #   Check archive integrity by using 'unzip -t' command.
+    #   Check file content with expected.
+    #   If any problem detected, error is thrown.
+    #
+    # Arguments:
+    #   files   List of files (as for createContent command)
+
+    proc check {files} {
+        upvar fname fname
+        variable tmpdir
+
+        exec unzip -t $fname
+
+        createContent expectedResult $files
+        file delete -force $tmpdir/testResult
+        file mkdir $tmpdir/testResult
+        exec unzip -nd $tmpdir/testResult $fname
+        exec diff -ura $tmpdir/testResult $tmpdir/expectedResult
+    }
+
+    # stripValgrindOutput --
+    #
+    #   Strip valgrind's output from data. If valgrinding is not enabled,
+    #   return data as is.
+
+    proc stripValgrindOutput {data} {
+        set res {}
+        foreach line [ split $data "\n" ] {
+            if {![ regexp {^==\d+== } $line ]} {
+                lappend res $line
+            }
+        }
+        return [ join $res "\n" ]
+    }
+
+    # makeFile --
+    #
+    #   Version of tclTest::makeFile that does not creates newline at the end
+    #   of file.
+
+    proc makeFile {contents name {directory {}}} {
+        variable tmpdir
+
+        if {$directory eq ""} {
+            set fname $tmpdir/$name
+        } else {
+            set fname $directory/$name
+        }
+        file mkdir [ file dirname $fname ]
+        set f [ open $fname w ]
+        puts -nonewline $f $contents
+        close $f
+    }
+
+    # finalize --
+    #
+    #   Clean up temporary files, print statistics and exit.
+
+    proc finalize {} {
+        variable numPassed
+        variable numFailed
+        variable numSkipped
+        variable tmpdir
+        variable listTests
+        variable failed
+
+        forceumount
+        file delete -force $tmpdir
+
+        if {!$listTests} {
+            if {[ llength $failed ] > 0} {
+                puts "Failed tests: [ join $failed ]"
+            }
+            puts [ format {Total: %3d   Passed: %3d   Failed: %3d   Skipped %3d} \
+                [ expr {$numPassed + $numFailed + $numSkipped} ] \
+                $numPassed $numFailed $numSkipped \
+            ]
+            if {$numFailed != 0} {
+                exit 1
+            } else {
+                exit 0
+            }
+        } else {
+            exit 0
+        }
+    }
+
+    ############################################################
+    # INITIALIZATION
+    ############################################################
+    
+    parseArgs
+
+    signal trap {HUP INT TERM} "puts stderr Interrupt; ::[ namespace current ]::finalize"
+
+    if {$listTests} {
+        # Stub for fstest that only prints test IDs and descriptions
+
+        proc fstest {id description script} {
+            puts [ format "%-40s %s" $id $description ]
+        }
+    }
+
+    ############################################################
+    # TESTS
+    ############################################################
+
+    fstest usage {Usage test} {
+        lassign [ pipe ] r w
+        if {![ catch {exec -ignorestderr {*}[ wrapIfNeeded $binary ] 2>@ $w} res opts ]} {
+            close $w
+            close $r
+            error "Error code should be non-zero!"
+        }
+        close $w
+        set data [ string trim [ read $r ] ]
+        close $r
+        if {![ regexp {^usage: fuse-zip } [ stripValgrindOutput $data ] ]} {
+            error "Usage info expected, but `$data' given"
+        }
+    }
+
+    fstest version {Version test} {
+        lassign [ pipe ] r w
+        if {![ catch {exec -ignorestderr {*}[ wrapIfNeeded $binary ] -V 2>@ $w} res opts ]} {
+            close $w
+            close $r
+            error "Error code should be non-zero!"
+        }
+        close $w
+        set data [ string trim [ read $r ] ]
+        close $r
+        if {![ regexp {^(.*?version.*?\d+\.\d+\n)+$} \
+                "[ stripValgrindOutput $data ]\n" ]} {
+            error "Version info expected"
+        }
+    }
+
+    fstest bad-mountpoint {Bad mountpoint} {
+        file delete -force $mountdir
+        if {![ catch {mount} err opts ] ||
+                [ dict get $opts -errorcode ] ne "NOTMOUNTED"} {
+            error "Mount error is expected"
+        } else {
+            set msg [ stripValgrindOutput [ join $error \n ] ]
+            if {![ regexp {^fuse: bad mount point} $msg ]} {
+                error "Invalid error message: $msg"
+            }
+        }
+    }
+
+    fstest bad-archive-crc {Bad archive} {
+        set fname data/bad-archive.zip
+        mount
+        if {![catch {open $mountdir/bash.txt r} err opts]} {
+            error "File read error is expected"
+        } else {
+            set code [dict get $opts -errorcode]
+            assert {[lrange $code 0 1] == {POSIX EIO}}
+        }
+        umount
+    }
+
+    fstest mount-umount {Mount and unmount nonexistent file} {
+        set fname $tmpdir/nonexistent.zip
+        mount
+        umount
+        if {[ file exist $fname ]} {
+            error "Archive should not exist!"
+        }
+    }
+
+    fstest 65536-files {Check that file system correctly handle more than 65535 files (issue #34)} {
+        set content {}
+        set count 65536
+        for {set i 1} {$i <= $count} {incr i} {
+            lappend content $i ""
+        }
+
+        create $content
+        mount
+        set fnames [glob -directory $mountdir -nocomplain -tails *]
+        assert {[llength $fnames] == $count} "not all files are visible"
+        umount
+    }
+
+    fstest add-file-to-empty-archive {Add file to empty archive} {
+        set fname $tmpdir/empty.zip
+
+        mount
+        makeFile {file content} somefile $mountdir
+        umount
+
+        check {
+            somefile {file content}
+        }
+    }
+
+    fstest add-file {Add file to archive} {
+        create {
+            foo.bar foobar
+            f/
+            f/o/
+            f/o/o content
+            foo/
+            foo/bar foo-bar
+        }
+        mount
+        makeFile moo-moo moo $mountdir
+        umount
+
+        check {
+            moo moo-moo
+            foo.bar foobar
+            f/
+            f/o/
+            f/o/o content
+            foo/
+            foo/bar foo-bar
+        }
+    }
+
+    fstest add-dir {Add directory to archive} {
+        create {
+            foo.bar foobar
+            f/
+            f/o/
+            f/o/o content
+            foo/
+            foo/bar foo-bar
+        }
+        mount
+        file mkdir $mountdir/foo/first
+        file mkdir $mountdir/foo/first/second
+        umount
+
+        check {
+            foo.bar foobar
+            f/
+            f/o/
+            f/o/o content
+            foo/
+            foo/bar foo-bar
+            foo/first/
+            foo/first/second/
+        }
+    }
+
+    fstest add-remove-file {Add file to archive and remove it} {
+        create {
+            foo.bar foobar
+            f/
+            f/o/
+            f/o/o content
+            foo/
+            foo/bar foo-bar
+        }
+        mount
+        makeFile moo-moo moo $mountdir
+        file delete $mountdir/moo
+        umount
+
+        check {
+            foo.bar foobar
+            f/
+            f/o/
+            f/o/o content
+            foo/
+            foo/bar foo-bar
+        }
+    }
+
+    fstest add-truncate-file {Add file to archive and truncate it} {
+        create {
+            foo.bar foobar
+        }
+        mount
+        makeFile moo-moo moo $mountdir
+        ftruncate $mountdir/moo 3
+        umount
+
+        check {
+            foo.bar foobar
+            moo moo
+        }
+    }
+
+    fstest add-truncate-remove-file {Add file to archive, truncate and remove it} {
+        create {
+            foo.bar foobar
+        }
+        mount
+        makeFile moo-moo moo $mountdir
+        ftruncate $mountdir/moo 3
+        file delete $mountdir/moo
+        umount
+
+        check {
+            foo.bar foobar
+        }
+    }
+
+    fstest add-overwrite-file {Add file to archive and overwrite it} {
+        create {
+            foo.bar foobar
+        }
+        mount
+        makeFile moo-moo moo $mountdir
+        makeFile Gerasim moo $mountdir
+        umount
+
+        check {
+            foo.bar foobar
+            moo Gerasim
+        }
+    }
+
+    fstest remove-file {Remove file from archive} {
+        create {
+            filename.ext blah-blah
+            filename2.ext blah-blah
+        }
+        mount
+        file delete $mountdir/filename.ext
+        umount
+        check {
+            filename2.ext blah-blah
+        }
+    }
+
+    fstest remove-dir {Remove directory from archive} {
+        create {
+            filename.ext blah-blah
+            foo/
+            foo/moo {}
+            bar/
+        }
+        mount
+        file delete -force $mountdir/foo
+        umount
+        check {
+            filename.ext blah-blah
+            bar/
+        }
+    }
+
+    fstest remove-nonexistent-dir {Remove nonexistent directory from archive} {
+        create {
+            filename.ext blah-blah
+            bar/
+        }
+        mount
+        if {![ catch {
+            exec rmdir $mountdir/foo
+        } err opts ]} {
+            error "rmdir error is expected!"
+        }
+        umount
+        check {
+            filename.ext blah-blah
+            bar/
+        }
+    }
+
+    fstest remove-last-file {Remove last file from archive} {
+        create {
+            filename.ext blah-blah
+        }
+        mount
+        file delete $mountdir/filename.ext
+        umount
+        if {[ file exist $fname ]} {
+            puts [ exec cat $fname ]
+            error "Archive should not exist!"
+        }
+    }
+
+    fstest overwrite-file {Overwrite existing file} {
+        create {
+            filename.ext blah-blah
+        }
+        mount
+
+        set f [ open $mountdir/filename.ext w ]
+        puts $f "Be-be-be!"
+        close $f
+        umount
+        check {
+            filename.ext "Be-be-be!\n"
+        }
+    }
+
+    fstest truncate {Truncate existing file} {
+        create {
+            filename.ext blah-blah
+        }
+        mount
+        ftruncate $mountdir/filename.ext 5
+
+        set f [ open $mountdir/filename.ext r ]
+        set data [ read $f ]
+        close $f
+
+        if {[ string compare $data "blah-" ] != 0} {
+            error "Invalid content: $data"
+        }
+
+        umount
+        check {
+            filename.ext blah-
+        }
+    }
+
+    fstest truncate-remove {Truncate existing file and delete it} {
+        create {
+            filename.ext blah-blah
+            other other
+        }
+        mount
+        ftruncate $mountdir/filename.ext 5
+        file delete $mountdir/filename.ext
+
+        umount
+        check {
+            other other
+        }
+    }
+
+    fstest truncate-on-chunk-boundary {Truncate existing file on a chunk boundary} {
+        create [ list \
+            filename.ext [ string repeat a 8192 ]
+        ]
+        mount
+        ftruncate $mountdir/filename.ext 4096
+        umount
+        check [ list \
+            filename.ext [ string repeat a 4096 ] \
+        ]
+    }
+
+    fstest truncate-to-zero {Truncate existing file (to zero size)} {
+        create {
+            filename.ext blah-blah
+        }
+        mount
+        ftruncate $mountdir/filename.ext 0
+        umount
+        check {
+            filename.ext {}
+        }
+    }
+
+    fstest truncate-after-end-same-chunk {Truncate existing file after the end (without new chunks creation)} {
+        create {
+            filename.ext blah-blah
+        }
+        mount
+        ftruncate $mountdir/filename.ext 11
+
+        set f [ open $mountdir/filename.ext r ]
+        set data [ read $f ]
+        close $f
+
+        if {[ string compare $data "blah-blah\x00\x00" ] != 0} {
+            error "Invalid content: $data"
+        }
+
+        umount
+        check {
+            filename.ext "blah-blah\x00\x00"
+        }
+    }
+
+    fstest truncate-after-end-other-chunk {Truncate existing file after the end (with new chunk creation)} {
+        create {
+            filename.ext blah-blah
+        }
+        mount
+        ftruncate $mountdir/filename.ext 5009
+        set content "blah-blah[ string repeat "\x00" 5000 ]"
+
+        set f [ open $mountdir/filename.ext r ]
+        set data [ read $f ]
+        close $f
+
+        if {[ string compare $data $content ] != 0} {
+            error "Invalid content: $data"
+        }
+
+        umount
+        check [ list \
+            filename.ext $content \
+        ]
+    }
+
+    fstest truncate-expand-read {Truncate file, expand it and read} {
+        create {
+            filename.ext blah-blah
+        }
+        mount
+        ftruncate $mountdir/filename.ext 4
+        ftruncate $mountdir/filename.ext 9
+        set content "blah[ string repeat "\x00" 5 ]"
+
+        set f [ open $mountdir/filename.ext r ]
+        set data [ read $f ]
+        close $f
+
+        if {[ string compare $data $content ] != 0} {
+            error "Invalid content: $data"
+        }
+
+        umount
+        check [ list \
+            filename.ext $content \
+        ]
+    }
+
+    fstest truncate-after-end-other-chunk-twice {Truncate existing file after the end (with new chunk creation, twice)} {
+        create {
+            filename.ext blah-blah
+        }
+        mount
+        ftruncate $mountdir/filename.ext 5
+        ftruncate $mountdir/filename.ext 5005
+
+        set content "blah-[ string repeat "\x00" 5000 ]"
+
+        set f [ open $mountdir/filename.ext r ]
+        set data [ read $f ]
+        close $f
+
+        if {[ string compare $data $content ] != 0} {
+            error "Invalid content: $data"
+        }
+
+        umount
+        check [ list \
+            filename.ext $content \
+        ]
+    }
+
+    fstest sparse-file {Sparse files test} {
+        set fname $tmpdir/archive.zip
+        mount
+
+        set count 8201
+
+        set f [ open $mountdir/filename.ext w ]
+        seek $f $count start
+        puts -nonewline $f blah
+        close $f
+
+        set content "[ string repeat "\x00" $count ]blah"
+
+        set f [ open $mountdir/filename.ext r ]
+        set data [ read $f ]
+        close $f
+
+        if {[ string compare $content $data ] != 0} {
+            error "Invalid file content: $data"
+        }
+
+        umount
+        check [ list \
+            filename.ext $content \
+        ]
+    }
+
+    fstest sparse-file-2 {Sparse files test 2} {
+        create {
+            filename.ext start
+        }
+        mount
+
+        set count 4096
+
+        set f [ open $mountdir/filename.ext r+ ]
+        seek $f [ expr {5+$count} ] start
+        puts -nonewline $f end
+        close $f
+
+        set content "start[ string repeat "\x00" $count ]end"
+
+        set f [ open $mountdir/filename.ext r ]
+        set data [ read $f ]
+        close $f
+
+        if {[ string compare $content $data ] != 0} {
+            error "Invalid file content: $data"
+        }
+
+        umount
+        check [ list \
+            filename.ext $content \
+        ]
+    }
+
+    fstest sparse-truncate {Truncate sparse file} {
+        create {
+            filename.ext {}
+        }
+        mount
+
+        set count 4078
+
+        set f [ open $mountdir/filename.ext r+ ]
+        seek $f 8208 start
+        puts -nonewline $f data
+        flush $f
+        ftruncate -fileid $f $count
+        close $f
+
+        set content "[ string repeat "\x00" $count ]"
+
+        set f [ open $mountdir/filename.ext r ]
+        set data [ read $f ]
+        close $f
+
+        if {[ string compare $content $data ] != 0} {
+            error "Invalid file content: $data"
+        }
+
+        umount
+        check [ list \
+            filename.ext $content \
+        ]
+    }
+
+    fstest read-zero {Read zero-length file from archive} {
+        create {
+            filename.ext {}
+        }
+        mount
+        set f [ open $mountdir/filename.ext r ]
+        set data [ read $f ]
+        close $f
+
+        if {[ string compare $data "" ] != 0} {
+            error "Invalid content: $data"
+        }
+
+        umount
+    }
+
+    fstest read-file {Read file from archive} {
+        create {
+            filename.ext blah-blah
+        }
+        mount
+        set f [ open $mountdir/filename.ext r ]
+        set data [ read $f ]
+        close $f
+
+        if {[ string compare $data "blah-blah" ] != 0} {
+            error "Invalid content: $data"
+        }
+
+        umount
+    }
+
+    fstest read-file-two-handles {Read file from archive (two handles)} {
+        set content [ string repeat "abcdef" 3000 ]
+        set l [ string length $content ]
+        create [ list \
+            filename.ext $content \
+        ]
+        mount
+        set f1 [ open $mountdir/filename.ext r ]
+        set f2 [ open $mountdir/filename.ext r ]
+        set positions {
+            {0       6}
+            {10      1000}
+            {4097    322}
+            {27      15}
+            {1       1}
+            {3333    11}
+        }
+        for {set i 0} {$i < [ llength $positions ]} {incr i} {
+            lassign [ lindex $positions $i ] off size
+            seek $f1 $off
+            set data [ read $f1 $size ]
+            set expected [ string range $content $off [ expr {$off + $size - 1} ] ]
+            assert {$data eq $expected}
+
+            lassign [ lindex $positions end-$i ] off size
+            seek $f2 $off
+            set data [ read $f2 $size ]
+            set expected [ string range $content $off [ expr {$off + $size - 1} ] ]
+            assert {$data eq $expected}
+        }
+        close $f1
+        close $f2
+        umount
+    }
+
+    fstest read-file-random-access {Read file from archive (random access)} {
+        set content [ string repeat "abcdef" 3000 ]
+        set l [ string length $content ]
+        create [ list \
+            filename.ext $content \
+        ]
+        mount
+        set f [ open $mountdir/filename.ext r ]
+        foreach {off size} {
+            0       6
+            10      1000
+            4097    322
+            27      15
+            1       1
+            3333    11
+        } {
+            seek $f $off
+            set data [ read $f $size ]
+            set expected [ string range $content $off [ expr {$off + $size - 1} ] ]
+            assert {$data eq $expected}
+        }
+        close $f
+        umount
+    }
+
+    fstest read-file-three-chunks {Read file from archive (3 chunks)} {
+        set content [ string repeat "a" [ expr {4096*3-100} ] ]
+        create [ list \
+            filename.ext $content \
+        ]
+        mount
+        set f [ open $mountdir/filename.ext r ]
+        set data [ read $f ]
+        close $f
+
+        if {[ string compare $data $content ] != 0} {
+            error "Invalid content: '$data'"
+        }
+
+        umount
+    }
+
+    fstest read-on-end {Read on the end of file} {
+        set content [ string repeat "a" 100 ]
+        create [ list \
+            filename.ext $content \
+        ]
+        mount
+        set f [ open $mountdir/filename.ext r ]
+        fconfigure $f -encoding binary
+        seek $f 98
+        set data [ read $f 4 ]
+        close $f
+
+        if {[ string compare $data "aa" ] != 0} {
+            error "Invalid content: '$data'"
+        }
+
+        umount
+    }
+
+    fstest read-after-end {Read after the end of file} {
+        set content [ string repeat "b" 100 ]
+        create [ list \
+            filename.ext $content \
+        ]
+        mount
+        set f [ open $mountdir/filename.ext r ]
+        fconfigure $f -encoding binary
+        seek $f 102
+        set data [ read $f 4 ]
+        close $f
+
+        if {[ string compare $data "" ] != 0} {
+            error "Invalid content: '$data'"
+        }
+
+        umount
+    }
+
+    fstest read-bad-crc {Read file from archive (bad CRC)} {
+        set fname data/bad-crc.zip
+
+        mount
+        set res [ catch {
+            set f [ open $mountdir/bash.txt r ]
+            set data [ read $f ]
+            close $f
+        } err opts ]
+
+        umount
+
+        if {$res == 0 || [ lrange [ dict get $opts -errorcode ] 0 1 ] ne "POSIX EIO"} {
+            error "Read error expected"
+        }
+    }
+
+    fstest read-bad-crc-twice {Read file from archive (bad CRC, twice), changeset 80ad59679639} {
+        set fname data/bad-crc.zip
+
+        mount
+        foreach step {1st 2nd} {
+            set res [ catch {
+                set f [ open $mountdir/bash.txt r ]
+                set data [ read $f ]
+                close $f
+            } err opts ]
+            if {$res == 0 || [ lrange [ dict get $opts -errorcode ] 0 1 ] ne "POSIX EIO"} {
+                error "Read error expected on step $step"
+            }
+        }
+
+        umount
+
+    }
+
+    fstest find {Check that find is working on a filesystem} {
+        create {
+            foo.bar foobar
+            f/
+            f/o/
+            f/o/o content
+            foo/
+            foo/bar foo-bar
+        }
+        set in {
+            foo.bar
+            f
+            f/o
+            f/o/o
+            foo
+            foo/bar
+        }
+        mount
+        set data {}
+        set l [ string length "$mountdir/" ]
+        foreach line [ split [ exec find $mountdir ] "\n" ] {
+            if {[ string length $line ] > $l} {
+                lappend data [ string range $line $l end ]
+            }
+        }
+        umount
+
+        if {[ lsort $in ] != [ lsort $data ]} {
+            error "Invalid list of files returned: $data"
+        }
+    }
+
+    fstest append {Append to file} {
+        create {
+            foo foo
+        }
+        mount
+        set f [ open $mountdir/foo a ]
+        puts -nonewline $f bar
+        close $f
+
+        umount
+        check {
+            foo foobar
+        }
+    }
+
+    fstest compare-source-and-mountpoint {Compare source files with mountpoint content} {
+        create [ list \
+            foo.bar foobar  \
+            f/              \
+            f/o/            \
+            f/o/o content   \
+            foo/            \
+            foo/bar foo-bar \
+            bigFile [ string repeat "substances! " 9000 ] \
+            zerofile {}     \
+            longName_longName_longName_longName_longName_longName_longName_longName_longName_longName_longName_longName_longName_longName_longName_longName_longName_longName_longName_longName_longName_longName_longName_longName_longName {}
+        ]
+        mount
+        exec diff -Nura $tmpdir/archiveSource $mountdir
+        umount
+    }
+
+    fstest iconv-cp866 {Check that archive from 'other' OS correctly mounted} {
+        set fname data/cp866.zip
+
+        mount -o modules=iconv,from_code=cp866
+
+        if {[ lsort [ glob -directory $mountdir -tails * ] ] ne
+                [ lsort "{\u0422\u0435\u043a\u0441\u0442\u043e\u0432\u044b\u0439 \u0434\u043e\u043a\u0443\u043c\u0435\u043d\u0442.txt} \u0414\u0430\u0442\u0430" ]} {
+            error "File names incorrectly decoded: [ glob -directory $mountdir * ]"
+        }
+
+        umount
+    }
+
+    fstest rename-file {Rename file} {
+        create {
+            foo.bar foobar
+        }
+        mount
+        file rename $mountdir/foo.bar $mountdir/john_doe
+        umount
+
+        check {
+            john_doe foobar
+        }
+    }
+
+    fstest rename-non-ascii-file {Rename file with non-ASCII characters in name} {
+        create {
+            \u0431\u0430\u043B\u0430\u043B\u0430\u0439\u043A\u0430 foobar
+        }
+        mount
+        file rename $mountdir/\u0431\u0430\u043B\u0430\u043B\u0430\u0439\u043A\u0430 $mountdir/\u043C\u0435\u0434\u0432\u0435\u0434\u044C
+        umount
+
+        check {
+            \u043C\u0435\u0434\u0432\u0435\u0434\u044C foobar
+        }
+    }
+
+    fstest rename-file-new-dir {Rename file (new directory creation)} {
+        create {
+            foo.bar foobar
+            squirrel belka
+        }
+        mount
+        file mkdir $mountdir/test
+        file rename $mountdir/foo.bar $mountdir/test/john_doe
+        set ls [ glob -directory $mountdir -tails * ]
+        if {![ ::struct::set equal {test squirrel} $ls ]} {
+            error "Invalid files in /: $ls"
+        }
+        set ls [ glob -directory $mountdir/test -tails * ]
+        if {![ ::struct::set equal {john_doe} $ls ]} {
+            error "Invalid files in /test: $ls"
+        }
+        umount
+
+        check {
+            test/john_doe foobar
+            squirrel belka
+        }
+    }
+
+    fstest rename-file-new-path {Rename file (change directory)} {
+        create {
+            foo.bar foobar
+            test/
+            test/blah {blah-blah}
+        }
+        mount
+        file rename $mountdir/foo.bar $mountdir/test/john_doe
+        set ls [ glob -directory $mountdir -tails * ]
+        if {![ ::struct::set equal {test} $ls ]} {
+            error "Invalid files in /: $ls"
+        }
+        set ls [ glob -directory $mountdir/test -tails * ]
+        if {![ ::struct::set equal {blah john_doe} $ls ]} {
+            error "Invalid files in /test: $ls"
+        }
+        umount
+
+        check {
+            test/john_doe foobar
+            test/blah {blah-blah}
+        }
+    }
+
+    fstest rename-empty-dir {Rename empty directory} {
+        create {
+            foo/
+        }
+        mount
+        file rename $mountdir/foo $mountdir/bar
+        umount
+
+        check {
+            bar/
+        }
+    }
+
+    fstest rename-non-empty-dir {Rename non-empty directory} {
+        create {
+            foo/john/doe {Hi}
+            foo/bar {content}
+            foo/duck/tape/1 1
+        }
+        mount
+        file rename $mountdir/foo $mountdir/bar
+        umount
+
+        check {
+            bar/john/doe {Hi}
+            bar/bar {content}
+            bar/duck/tape/1 1
+        }
+    }
+
+    fstest rename-non-empty-dir-new-path {Rename non-empty directory (new dir)} {
+        create {
+            foo/bar {content}
+            foo/john/doe {Hi}
+            foo/duck/tape/
+        }
+        mount
+        file mkdir $mountdir/bar
+        file rename $mountdir/foo $mountdir/bar/duck
+        umount
+
+        check {
+            bar/duck/bar {content}
+            bar/duck/john/doe {Hi}
+            bar/duck/duck/tape/
+        }
+    }
+
+    fstest rename-file-to-existent {Renamed file to existent file} {
+        create {
+            kitten {Meow}
+            puppy {Woof}
+        }
+        mount
+        file rename -force $mountdir/kitten $mountdir/puppy
+        umount
+
+        check {
+            puppy {Meow}
+        }
+    }
+
+    fstest size-file {Check file size} {
+        create {
+            foobar blah-blah
+        }
+        mount
+        assert {[ file size $mountdir/foobar ] == 9}
+        makeFile doe john $mountdir
+        assert {[ file size $mountdir/john ] == 3}
+        umount
+        check {
+            foobar blah-blah
+            john doe
+        }
+    }
+
+    fstest size-dir {Check directory size} {
+        create {
+            foobar/
+        }
+        mount
+        assert {[ file size $mountdir/foobar ] == 0}
+        file mkdir $mountdir/john
+        assert {[ file size $mountdir/john ] == 0}
+        umount
+        check {
+            foobar/
+            john/
+        }
+    }
+
+    fstest read-only-mode {Check read only mode} {
+        create {
+            foo.bar foobar
+        }
+        file copy $fname $fname-copy
+        mount -r
+        umount
+
+        exec diff $fname $fname-copy
+    }
+
+    fstest dir-stub-read-only {Check that archive is not modified after mount/unmount in case of stub directories is created while loading file tree} {
+        file copy data/not-full-path.zip $tmpdir/not-full-path.zip
+        set fname $tmpdir/not-full-path.zip
+        mount -r
+        assert {[file exists $mountdir/foo/bar]}
+        umount
+        exec diff $fname data/not-full-path.zip
+    }
+
+    fstest dir-stub-rename {Check stub dirs rename} {
+        file copy data/not-full-path.zip $tmpdir/not-full-path.zip
+        set fname $tmpdir/not-full-path.zip
+        mount
+        assert {[file exists $mountdir/foo/bar]}
+        file rename $mountdir/foo $mountdir/foofoo
+        umount
+        check {
+            bebebe bebe\n
+            foofoo/
+            foofoo/bar blah-blah\n
+        }
+    }
+
+    fstest dir-stub-rmdir {Check that stubbed dir removed successfully} {
+        file copy data/not-full-path.zip $tmpdir/not-full-path.zip
+        set fname $tmpdir/not-full-path.zip
+        mount
+        file delete -force $mountdir/foo
+        umount
+        check {
+            bebebe bebe\n
+        }
+    }
+
+    fstest mkdir-rmdir {Check that mkdir()-rmdir() success} {
+        create {
+            a b
+        }
+
+        mount
+        file mkdir $mountdir/foo
+        file delete $mountdir/foo
+        umount
+        
+        check {
+            a b
+        }
+    }
+
+    fstest rmdir {Check that rmdir() success on non-stub directory} {
+        create {
+            a b
+            foo/
+        }
+
+        mount
+        file delete $mountdir/foo
+        umount
+        
+        check {
+            a b
+        }
+    }
+
+    fstest parent-relative-paths {Check for paths relative to parent directory in archive} {
+        set fname data/parent-relative-paths.zip
+        if {![ catch {mount} err opts ] ||
+                [ dict get $opts -errorcode ] ne "NOTMOUNTED"} {
+            error "Mount error is expected"
+        } else {
+            set msg [ stripValgrindOutput [ join $error \n ] ]
+            if {![ regexp {^fuse-zip: unable to open ZIP file: paths relative to parent directory are not supported} $msg ]} {
+                error "Invalid error message: $msg"
+            }
+        }
+    }
+
+    fstest absolute-path {Check for absolute paths in archive} {
+        set fname data/absolute-path.zip
+        if {![catch {mount} err opts] || [dict get $opts -errorcode] ne "NOTMOUNTED"} {
+            error "Mount error is expected"
+        } else {
+            set msg [stripValgrindOutput [join $error \n]]
+            if {![regexp {^fuse-zip: unable to open ZIP file: absolute paths are not supported} $msg]} {
+                error "Invalid error message: $msg"
+            }
+        }
+    }
+
+    finalize
+}
+namespace delete ::util::test
+
+# vim: set ft=tcl:
